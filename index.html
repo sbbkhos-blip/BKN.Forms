@@ -1,0 +1,166 @@
+const PERSONAL_SHEET = 'Personal';
+const DEPT_SHEET = 'Department';
+const REF_PEOPLE_SHEET = 'รายชื่อบุคคล';
+const REF_COST_SHEET = 'หน่วยต้นทุนทุกหน่วยที่เบิก';
+const REF_DEPTTOTAL_SHEET = 'รายชื่อกลุ่มงาน';
+
+function getSheet_(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    if (name === PERSONAL_SHEET) {
+      sheet.appendRow(['เวลาที่ส่ง', 'รหัสประจำตัว', 'หน่วยงาน', 'ชื่อ-นามสกุล', 'มี EV หรือไม่', 'รายการยานพาหนะ (สรุป)', 'รายการยานพาหนะ (JSON)', 'นำมาปฏิบัติงานหรือไม่', 'ต้องการใช้สถานีชาร์จหรือไม่', 'ข้อเสนอแนะ']);
+    } else if (name === DEPT_SHEET) {
+      sheet.appendRow(['เวลาที่ส่ง', 'รหัสต้นทุน', 'ชื่อหน่วยงาน', 'ผู้ส่งข้อมูล', 'ตำแหน่ง', 'เบอร์โทรภายใน', 'มี EV หรือไม่', 'รายการยานพาหนะ (สรุป)', 'รายการยานพาหนะ (JSON)', 'นำมาปฏิบัติงานหรือไม่', 'ต้องการใช้สถานีชาร์จหรือไม่', 'ข้อเสนอแนะ']);
+    }
+    sheet.getRange(1, 1, 1, sheet.getLastColumn()).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+// อ่านชีตอ้างอิง (รายชื่อบุคคล / หน่วยต้นทุน / กลุ่มงาน) เป็น array of object โดยอิงจากหัวคอลัมน์ (row 1)
+// ทำให้แก้ไข เพิ่ม หรือลบแถวในชีตเหล่านี้ได้อิสระ โดยไม่ต้องแก้โค้ด — เว็บจะดึงข้อมูลล่าสุดทุกครั้งที่โหลดหน้า
+function readRefSheet_(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(name);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0].map(h => String(h).trim());
+  const rows = values.slice(1);
+  return rows
+    .map(r => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = r[i]; });
+      return obj;
+    })
+    .filter(obj => Object.values(obj).some(v => String(v).trim() !== ''));
+}
+
+function getReferenceData_() {
+  const peopleRaw = readRefSheet_(REF_PEOPLE_SHEET);
+  const costRaw = readRefSheet_(REF_COST_SHEET);
+  const deptTotalRaw = readRefSheet_(REF_DEPTTOTAL_SHEET);
+
+  const people = peopleRaw
+    .map(r => ({
+      id: String(r['รหัสประจำตัว'] || '').trim(),
+      dept: String(r['หน่วยงาน'] || '').trim(),
+      prefix: String(r['คำนำหน้า'] || '').trim(),
+      fname: String(r['ชื่อ'] || '').trim(),
+      lname: String(r['นามสกุล'] || '').trim()
+    }))
+    .filter(p => p.id && p.fname);
+
+  const costcenters = costRaw
+    .map(r => ({
+      code: String(r['รหัส'] || '').trim(),
+      name: String(r['หน่วยงาน'] || '').trim()
+    }))
+    .filter(c => c.code && c.name);
+
+  const depttotals = deptTotalRaw
+    .map(r => ({
+      name: String(r['หน่วยงาน'] || '').trim(),
+      total: Number(r['จำนวน (คน)'] || r['จำนวนคน'] || r['จำนวน'] || 0) || 0
+    }))
+    .filter(d => d.name && d.name.indexOf('รวม') === -1); // ตัดแถวสรุปยอดรวม (เช่น "รวมทั้งหมด") ออก ไม่ให้ขึ้นเป็นหน่วยงานปลอม
+
+  return { people: people, costcenters: costcenters, depttotals: depttotals };
+}
+
+function doGet(e) {
+  const personalSheet = getSheet_(PERSONAL_SHEET);
+  const deptSheet = getSheet_(DEPT_SHEET);
+
+  const personalLastRow = personalSheet.getLastRow();
+  const deptLastRow = deptSheet.getLastRow();
+
+  const personalIds = personalLastRow > 1
+    ? personalSheet.getRange(2, 2, personalLastRow - 1, 1).getValues().flat().map(String).filter(String)
+    : [];
+  const deptCodes = deptLastRow > 1
+    ? deptSheet.getRange(2, 2, deptLastRow - 1, 1).getValues().flat().map(String).filter(String)
+    : [];
+
+  const ref = getReferenceData_();
+
+  const out = {
+    status: 'ok',
+    personalIds: personalIds,
+    deptCodes: deptCodes,
+    people: ref.people,
+    costcenters: ref.costcenters,
+    depttotals: ref.depttotals
+  };
+
+  return ContentService.createTextOutput(JSON.stringify(out))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents);
+
+    if (data.formType === 'personal') {
+      const sheet = getSheet_(PERSONAL_SHEET);
+      // ป้องกันข้อมูลซ้ำ: ถ้ารหัสนี้เคยส่งแล้ว ให้ปฏิเสธ
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        const existingIds = sheet.getRange(2, 2, lastRow - 1, 1).getValues().flat().map(String);
+        if (existingIds.indexOf(String(data.id)) !== -1) {
+          return jsonOut_({ status: 'duplicate', message: 'รหัสนี้ส่งข้อมูลไปแล้ว' });
+        }
+      }
+      sheet.appendRow([
+        new Date(),
+        data.id,
+        data.dept,
+        data.name,
+        data.hasEV,
+        data.vehiclesText || '',
+        JSON.stringify(data.vehicles || []),
+        data.bringToWork || '',
+        data.wantCharging || '',
+        data.suggestion || ''
+      ]);
+      return jsonOut_({ status: 'ok' });
+    }
+
+    if (data.formType === 'department') {
+      const sheet = getSheet_(DEPT_SHEET);
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        const existingCodes = sheet.getRange(2, 2, lastRow - 1, 1).getValues().flat().map(String);
+        if (existingCodes.indexOf(String(data.costCode)) !== -1) {
+          return jsonOut_({ status: 'duplicate', message: 'หน่วยงานนี้ส่งข้อมูลไปแล้ว' });
+        }
+      }
+      sheet.appendRow([
+        new Date(),
+        data.costCode,
+        data.deptName,
+        data.submitterName || '',
+        data.position || '',
+        data.phone || '',
+        data.hasEV,
+        data.vehiclesText || '',
+        JSON.stringify(data.vehicles || []),
+        data.bringToWork || '',
+        data.wantCharging || '',
+        data.suggestion || ''
+      ]);
+      return jsonOut_({ status: 'ok' });
+    }
+
+    return jsonOut_({ status: 'error', message: 'unknown formType' });
+  } catch (err) {
+    return jsonOut_({ status: 'error', message: String(err) });
+  }
+}
+
+function jsonOut_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
